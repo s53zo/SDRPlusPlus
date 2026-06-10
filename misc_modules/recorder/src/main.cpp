@@ -7,8 +7,12 @@
 #include <dsp/routing/splitter.h>
 #include <dsp/audio/volume.h>
 #include <dsp/convert/stereo_to_mono.h>
+#include <atomic>
 #include <thread>
+#include <chrono>
 #include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <gui/gui.h>
 #include <filesystem>
 #include <signal_path/signal_path.h>
@@ -95,6 +99,13 @@ public:
         if (config.conf[name].contains("ignoreSilence")) {
             ignoreSilence = config.conf[name]["ignoreSilence"];
         }
+        if (config.conf[name].contains("signalCsvLogging")) {
+            signalCsvLogging = config.conf[name]["signalCsvLogging"];
+        }
+        if (config.conf[name].contains("signalCsvOnly")) {
+            signalCsvOnly = config.conf[name]["signalCsvOnly"];
+        }
+        if (signalCsvOnly) { signalCsvLogging = true; }
         if (config.conf[name].contains("nameTemplate")) {
             std::string _nameTemplate = config.conf[name]["nameTemplate"];
             if (_nameTemplate.length() > sizeof(nameTemplate)-1) {
@@ -167,74 +178,103 @@ public:
         std::lock_guard<std::recursive_mutex> lck(recMtx);
         if (recording) { return; }
 
+        wavRecording = !signalCsvOnly;
+        bool csvRecording = signalCsvLogging || signalCsvOnly;
+
         // Configure the wav writer
-        if (recMode == RECORDER_MODE_AUDIO) {
+        if (recMode == RECORDER_MODE_AUDIO && wavRecording) {
             if (selectedStreamName.empty()) { return; }
             samplerate = sigpath::sinkManager.getStreamSampleRate(selectedStreamName);
         }
         else {
             samplerate = sigpath::iqFrontEnd.getSampleRate();
         }
-        writer.setFormat(containers[containerId]);
-        writer.setChannels((recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2);
-        writer.setSampleType(sampleTypes[sampleTypeId]);
-        writer.setSamplerate(samplerate);
+        if (wavRecording) {
+            writer.setFormat(containers[containerId]);
+            writer.setChannels((recMode == RECORDER_MODE_AUDIO && !stereo) ? 1 : 2);
+            writer.setSampleType(sampleTypes[sampleTypeId]);
+            writer.setSamplerate(samplerate);
+        }
 
         // Open file
         std::string vfoName = (recMode == RECORDER_MODE_AUDIO) ? selectedStreamName : "";
-        std::string extension = ".wav";
-        std::string expandedPath = expandString(folderSelect.path + "/" + genFileName(nameTemplate, recMode, vfoName) + extension);
-        if (!writer.open(expandedPath)) {
-            flog::error("Failed to open file for recording: {0}", expandedPath);
-            return;
+        std::string expandedPath = expandString(folderSelect.path + "/" + genFileName(nameTemplate, recMode, vfoName));
+        if (wavRecording) {
+            std::string wavPath = expandedPath + ".wav";
+            if (!writer.open(wavPath)) {
+                flog::error("Failed to open file for recording: {0}", wavPath);
+                return;
+            }
+        }
+        if (csvRecording) {
+            signalCsvFile.clear();
+            signalCsvFile.open(expandedPath + ".csv");
+            if (!signalCsvFile.is_open()) {
+                flog::error("Failed to open signal CSV for recording: {0}", expandedPath + ".csv");
+                signalCsvFile.clear();
+                if (wavRecording) { writer.close(); }
+                return;
+            }
+            signalCsvFile << "timestamp_unix_ms,frequency_hz,signal_dbm\n";
         }
 
         // Open audio stream or baseband
-        if (recMode == RECORDER_MODE_AUDIO) {
-            // Start correct path depending on 
-            if (stereo) {
-                stereoSink.start();
+        if (wavRecording) {
+            if (recMode == RECORDER_MODE_AUDIO) {
+                // Start correct path depending on
+                if (stereo) {
+                    stereoSink.start();
+                }
+                else {
+                    s2m.start();
+                    monoSink.start();
+                }
+                splitter.bindStream(&stereoStream);
             }
             else {
-                s2m.start();
-                monoSink.start();
+                // Create and bind IQ stream
+                basebandStream = new dsp::stream<dsp::complex_t>();
+                basebandSink.setInput(basebandStream);
+                basebandSink.start();
+                sigpath::iqFrontEnd.bindIQStream(basebandStream);
             }
-            splitter.bindStream(&stereoStream);
-        }
-        else {
-            // Create and bind IQ stream
-            basebandStream = new dsp::stream<dsp::complex_t>();
-            basebandSink.setInput(basebandStream);
-            basebandSink.start();
-            sigpath::iqFrontEnd.bindIQStream(basebandStream);
         }
 
         recording = true;
+        recordingStart = std::chrono::steady_clock::now();
+        if (signalCsvFile.is_open()) {
+            signalCsvThreadRunning = true;
+            signalCsvThread = std::thread(&RecorderModule::signalCsvWorker, this);
+        }
     }
 
     void stop() {
         std::lock_guard<std::recursive_mutex> lck(recMtx);
         if (!recording) { return; }
 
-        // Close audio stream or baseband
-        if (recMode == RECORDER_MODE_AUDIO) {
-            splitter.unbindStream(&stereoStream);
-            monoSink.stop();
-            stereoSink.stop();
-            s2m.stop();
-            
-        }
-        else {
-            // Unbind and destroy IQ stream
-            sigpath::iqFrontEnd.unbindIQStream(basebandStream);
-            basebandSink.stop();
-            delete basebandStream;
-        }
+        stopSignalCsvLogger();
 
-        // Close file
-        writer.close();
+        // Close audio stream or baseband
+        if (wavRecording) {
+            if (recMode == RECORDER_MODE_AUDIO) {
+                splitter.unbindStream(&stereoStream);
+                monoSink.stop();
+                stereoSink.stop();
+                s2m.stop();
+            }
+            else {
+                // Unbind and destroy IQ stream
+                sigpath::iqFrontEnd.unbindIQStream(basebandStream);
+                basebandSink.stop();
+                delete basebandStream;
+            }
+
+            // Close file
+            writer.close();
+        }
         
         recording = false;
+        wavRecording = false;
     }
 
 private:
@@ -347,9 +387,34 @@ private:
             }
         }
 
+        if (_this->recording) { style::beginDisabled(); }
+        if (ImGui::Checkbox(CONCAT("Signal level CSV##_recorder_signal_csv_", _this->name), &_this->signalCsvLogging)) {
+            if (!_this->signalCsvLogging) { _this->signalCsvOnly = false; }
+            config.acquire();
+            config.conf[_this->name]["signalCsvLogging"] = _this->signalCsvLogging;
+            config.conf[_this->name]["signalCsvOnly"] = _this->signalCsvOnly;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Logs selected VFO waterfall FFT level every 100ms. Hardware calibration may vary.");
+        }
+        if (!_this->signalCsvLogging) { style::beginDisabled(); }
+        if (ImGui::Checkbox(CONCAT("Signal CSV only##_recorder_signal_csv_only_", _this->name), &_this->signalCsvOnly)) {
+            if (_this->signalCsvOnly) { _this->signalCsvLogging = true; }
+            config.acquire();
+            config.conf[_this->name]["signalCsvLogging"] = _this->signalCsvLogging;
+            config.conf[_this->name]["signalCsvOnly"] = _this->signalCsvOnly;
+            config.release(true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Records only selected VFO signal level CSV and does not create a WAV file.");
+        }
+        if (!_this->signalCsvLogging) { style::endDisabled(); }
+        if (_this->recording) { style::endDisabled(); }
+
         // Record button
         bool canRecord = _this->folderSelect.pathIsValid();
-        if (_this->recMode == RECORDER_MODE_AUDIO) { canRecord &= !_this->selectedStreamName.empty(); }
+        if (_this->recMode == RECORDER_MODE_AUDIO && !_this->signalCsvOnly) { canRecord &= !_this->selectedStreamName.empty(); }
         if (!_this->recording) {
             if (ImGui::Button(CONCAT("Record##_recorder_rec_", _this->name), ImVec2(menuWidth, 0))) {
                 _this->start();
@@ -360,7 +425,7 @@ private:
             if (ImGui::Button(CONCAT("Stop##_recorder_rec_", _this->name), ImVec2(menuWidth, 0))) {
                 _this->stop();
             }
-            uint64_t seconds = _this->writer.getSamplesWritten() / _this->samplerate;
+            uint64_t seconds = _this->wavRecording ? (_this->writer.getSamplesWritten() / _this->samplerate) : std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - _this->recordingStart).count();
             time_t diff = seconds;
             tm* dtm = gmtime(&diff);
 
@@ -560,6 +625,77 @@ private:
         _this->writer.write(data, count);
     }
 
+    void stopSignalCsvLogger() {
+        if (signalCsvThreadRunning) {
+            signalCsvThreadRunning = false;
+            if (signalCsvThread.joinable()) {
+                signalCsvThread.join();
+            }
+        }
+        if (signalCsvFile.is_open()) {
+            signalCsvFile.close();
+        }
+    }
+
+    void signalCsvWorker() {
+        while (signalCsvThreadRunning) {
+            auto start = std::chrono::steady_clock::now();
+            writeSignalCsvRow();
+            std::this_thread::sleep_until(start + std::chrono::milliseconds(100));
+        }
+    }
+
+    void writeSignalCsvRow() {
+        double frequency = 0.0;
+        float signal = 0.0f;
+        if (!getSelectedVFOSignalLevel(frequency, signal)) { return; }
+
+        auto now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        signalCsvFile << timestamp << "," << std::fixed << std::setprecision(0) << frequency << "," << std::setprecision(3) << signal << "\n";
+    }
+
+    bool getSelectedVFOSignalLevel(double& frequency, float& signal) {
+        std::string vfoName = gui::waterfall.selectedVFO;
+        if (vfoName.empty()) { return false; }
+
+        auto vfoIt = gui::waterfall.vfos.find(vfoName);
+        if (vfoIt == gui::waterfall.vfos.end()) { return false; }
+
+        int dataWidth = 0;
+        float* data = gui::waterfall.acquireLatestFFT(dataWidth);
+        if (!data) { return false; }
+        if (dataWidth <= 0) {
+            gui::waterfall.releaseLatestFFT();
+            return false;
+        }
+
+        ImGui::WaterfallVFO* vfo = vfoIt->second;
+        double center = gui::waterfall.getCenterFrequency() + vfo->generalOffset;
+        double wfCenter = gui::waterfall.getViewOffset() + gui::waterfall.getCenterFrequency();
+        double wfWidth = gui::waterfall.getViewBandwidth();
+        double wfStart = wfCenter - (wfWidth / 2.0);
+        double wfEnd = wfCenter + (wfWidth / 2.0);
+        double low = center - (vfo->bandwidth / 2.0);
+        double high = center + (vfo->bandwidth / 2.0);
+        if (wfWidth <= 0.0 || high < wfStart || low > wfEnd) {
+            gui::waterfall.releaseLatestFFT();
+            return false;
+        }
+        int lowId = std::clamp<int>((low - wfStart) * (double)dataWidth / wfWidth, 0, dataWidth - 1);
+        int highId = std::clamp<int>((high - wfStart) * (double)dataWidth / wfWidth, 0, dataWidth - 1);
+
+        float max = -INFINITY;
+        for (int i = lowId; i <= highId; i++) {
+            if (data[i] > max) { max = data[i]; }
+        }
+        gui::waterfall.releaseLatestFFT();
+
+        frequency = center;
+        signal = max;
+        return true;
+    }
+
     static void moduleInterfaceHandler(int code, void* in, void* out, void* ctx) {
         RecorderModule* _this = (RecorderModule*)ctx;
         std::lock_guard lck(_this->recMtx);
@@ -598,10 +734,14 @@ private:
     std::string selectedStreamName = "";
     float audioVolume = 1.0f;
     bool ignoreSilence = false;
+    bool signalCsvLogging = false;
+    bool signalCsvOnly = false;
     dsp::stereo_t audioLvl = { -100.0f, -100.0f };
 
     bool recording = false;
+    bool wavRecording = false;
     bool ignoringSilence = false;
+    std::chrono::steady_clock::time_point recordingStart;
     wav::Writer writer;
     std::recursive_mutex recMtx;
     dsp::stream<dsp::complex_t>* basebandStream;
@@ -609,6 +749,9 @@ private:
     dsp::sink::Handler<dsp::complex_t> basebandSink;
     dsp::sink::Handler<dsp::stereo_t> stereoSink;
     dsp::sink::Handler<float> monoSink;
+    std::ofstream signalCsvFile;
+    std::thread signalCsvThread;
+    std::atomic_bool signalCsvThreadRunning = false;
 
     OptionList<std::string, std::string> audioStreams;
     int streamId = 0;

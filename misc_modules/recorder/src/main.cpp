@@ -215,7 +215,8 @@ public:
                 if (wavRecording) { writer.close(); }
                 return;
             }
-            signalCsvFile << "timestamp_unix_ms,frequency_hz,signal_dbm\n";
+            signalCsvEmaValid = false;
+            signalCsvFile << "timestamp_unix_ms,frequency_hz,signal_peak_db,signal_avg_db,signal_ema_db\n";
         }
 
         // Open audio stream or baseband
@@ -646,16 +647,29 @@ private:
     }
 
     void writeSignalCsvRow() {
-        double frequency = 0.0;
-        float signal = 0.0f;
-        if (!getSelectedVFOSignalLevel(frequency, signal)) { return; }
+        SignalLevel signal;
+        if (!getSelectedVFOSignalLevel(signal)) { return; }
+
+        if (!signalCsvEmaValid) {
+            signalCsvEma = signal.peak;
+            signalCsvEmaValid = true;
+        }
+        else {
+            signalCsvEma = (SIGNAL_CSV_EMA_ALPHA * signal.peak) + ((1.0f - SIGNAL_CSV_EMA_ALPHA) * signalCsvEma);
+        }
 
         auto now = std::chrono::system_clock::now();
         auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        signalCsvFile << timestamp << "," << std::fixed << std::setprecision(0) << frequency << "," << std::setprecision(3) << signal << "\n";
+        signalCsvFile << timestamp << "," << std::fixed << std::setprecision(0) << signal.frequency << "," << std::setprecision(3) << signal.peak << "," << signal.average << "," << signalCsvEma << "\n";
     }
 
-    bool getSelectedVFOSignalLevel(double& frequency, float& signal) {
+    struct SignalLevel {
+        double frequency;
+        float peak;
+        float average;
+    };
+
+    bool getSelectedVFOSignalLevel(SignalLevel& signal) {
         std::string vfoName = gui::waterfall.selectedVFO;
         if (vfoName.empty()) { return false; }
 
@@ -686,13 +700,19 @@ private:
         int highId = std::clamp<int>((high - wfStart) * (double)dataWidth / wfWidth, 0, dataWidth - 1);
 
         float max = -INFINITY;
+        double sum = 0.0;
+        int count = 0;
         for (int i = lowId; i <= highId; i++) {
             if (data[i] > max) { max = data[i]; }
+            sum += data[i];
+            count++;
         }
         gui::waterfall.releaseLatestFFT();
+        if (count <= 0) { return false; }
 
-        frequency = center;
-        signal = max;
+        signal.frequency = center;
+        signal.peak = max;
+        signal.average = sum / (double)count;
         return true;
     }
 
@@ -752,6 +772,9 @@ private:
     std::ofstream signalCsvFile;
     std::thread signalCsvThread;
     std::atomic_bool signalCsvThreadRunning = false;
+    float signalCsvEma = 0.0f;
+    bool signalCsvEmaValid = false;
+    static constexpr float SIGNAL_CSV_EMA_ALPHA = 0.2f;
 
     OptionList<std::string, std::string> audioStreams;
     int streamId = 0;

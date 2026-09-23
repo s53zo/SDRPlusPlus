@@ -1,6 +1,7 @@
 #pragma once
 #include "frequency_xlator.h"
 #include "../multirate/rational_resampler.h"
+#include <stdexcept>
 
 namespace dsp::channel {
     class RxVFO : public Processor<complex_t, complex_t> {
@@ -30,6 +31,40 @@ namespace dsp::channel {
             filter.init(NULL, ftaps);
 
             base_type::init(in);
+        }
+
+        // After init(), permanently opt into synchronous process() calls only.
+        // Call with no concurrent processing or configuration. Embedded
+        // streams are unused: the resampler already frees its nested streams
+        // (including decimation-stage outputs). Keep their FIR delay buffers.
+        // Keep out.writeBuf at full input-block size for the frequency xlator;
+        // out is scratch storage in this mode, not a swappable output stream.
+        void releaseUnusedProcessBuffers() {
+            assert(base_type::_block_init);
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            if (base_type::running || base_type::tempStopped) {
+                throw std::logic_error("Cannot release buffers of a running RxVFO");
+            }
+            if (processOnly) { return; }
+            xlator.out.free();
+            resamp.out.free();
+            filter.out.free();
+            buffer::free(out.readBuf);
+            out.readBuf = nullptr;
+            processOnly = true;
+        }
+
+        void start() override {
+            std::lock_guard<std::recursive_mutex> lck(base_type::ctrlMtx);
+            if (processOnly) {
+                throw std::logic_error("A process-only RxVFO cannot be started");
+            }
+            base_type::start();
+        }
+
+        // Query after configuration, with no concurrent rate changes.
+        double getActualOutSamplerate() const {
+            return resamp.getActualOutSamplerate();
         }
 
         void setInSamplerate(double inSamplerate) {
@@ -99,7 +134,8 @@ namespace dsp::channel {
             return count;
         }
 
-        int run() {
+        int run() override {
+            if (processOnly) { return -1; }
             int count = base_type::_in->read();
             if (count < 0) { return -1; }
 
@@ -125,6 +161,7 @@ namespace dsp::channel {
         filter::FIR<complex_t, float> filter;
         tap<float> ftaps;
         bool filterNeeded;
+        bool processOnly = false;
 
         double _inSamplerate;
         double _outSamplerate;

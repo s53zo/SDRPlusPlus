@@ -5,6 +5,7 @@
 #include <dsp/stream.h>
 #include <dsp/types.h>
 #include <utils/event.h>
+#include <utils/synchronized_event.h>
 
 class SourceManager {
 public:
@@ -42,7 +43,7 @@ public:
     Event<std::string> onSourceRegistered;
     Event<std::string> onSourceUnregister;
     Event<std::string> onSourceUnregistered;
-    Event<double> onRetune;
+    SynchronizedEvent<double> onRetune;
 
 private:
     std::map<std::string, SourceHandler*> sources;

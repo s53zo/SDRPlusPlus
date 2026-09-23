@@ -23,6 +23,7 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
     _acquireFFTBuffer = acquireFFTBuffer;
     _releaseFFTBuffer = releaseFFTBuffer;
     _fftCtx = fftCtx;
+    _dcBlocking = dcBlocking;
 
     effectiveSr = _sampleRate / _decimRatio;
 
@@ -70,10 +71,12 @@ void IQFrontEnd::init(dsp::stream<dsp::complex_t>* in, double sampleRate, bool b
 }
 
 void IQFrontEnd::setInput(dsp::stream<dsp::complex_t>* in) {
+    onInputConfigurationChanging.emit(getSampleRate());
     inBuf.setInput(in);
 }
 
 void IQFrontEnd::setSampleRate(double sampleRate) {
+    onInputConfigurationChanging.emit(sampleRate / _decimRatio);
     // Temp stop the necessary blocks
     dcBlock.tempStop();
     for (auto& [name, vfo] : vfos) {
@@ -103,6 +106,7 @@ void IQFrontEnd::setBuffering(bool enabled) {
 }
 
 void IQFrontEnd::setDecimation(int ratio) {
+    onInputConfigurationChanging.emit(_sampleRate / ratio);
     // Temp stop the decimator
     decim.tempStop();
 
@@ -122,10 +126,13 @@ void IQFrontEnd::setDecimation(int ratio) {
 }
 
 void IQFrontEnd::setDCBlocking(bool enabled) {
+    if (_dcBlocking != enabled) { onInputConfigurationChanging.emit(getSampleRate()); }
+    _dcBlocking = enabled;
     preproc.setBlockEnabled(&dcBlock, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
 }
 
 void IQFrontEnd::setInvertIQ(bool enabled) {
+    onInputConfigurationChanging.emit(getSampleRate());
     preproc.setBlockEnabled(&conjugate, enabled, [=](dsp::stream<dsp::complex_t>* out){ split.setInput(out); });
 }
 

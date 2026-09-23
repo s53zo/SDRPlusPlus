@@ -7,8 +7,9 @@
 #include <dsp/routing/splitter.h>
 #include <dsp/audio/volume.h>
 #include <dsp/convert/stereo_to_mono.h>
-#include <atomic>
-#include <thread>
+#include <memory>
+#include <array>
+#include "signal_power.h"
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -123,6 +124,13 @@ public:
         s2m.init(&stereoStream);
 
         // Init sinks
+        csvSink.init(&csvStream, csvIQHandler, this);
+        csvRetuneHandler = {csvRetuned, this};
+        csvRateHandler = {csvRateChanged, this};
+        csvPlayHandler = {csvPlayChanged, this};
+        sigpath::sourceManager.onRetune.bindHandler(&csvRetuneHandler);
+        sigpath::iqFrontEnd.onInputConfigurationChanging.bindHandler(&csvRateHandler);
+        gui::mainWindow.onPlayStateChange.bindHandler(&csvPlayHandler);
         basebandSink.init(NULL, complexHandler, this);
         stereoSink.init(&stereoStream, stereoHandler, this);
         monoSink.init(&s2m.out, monoHandler, this);
@@ -132,6 +140,10 @@ public:
     }
 
     ~RecorderModule() {
+        // Drain callbacks before locking the mutex that those callbacks acquire.
+        sigpath::sourceManager.onRetune.unbindHandler(&csvRetuneHandler);
+        sigpath::iqFrontEnd.onInputConfigurationChanging.unbindHandler(&csvRateHandler);
+        gui::mainWindow.onPlayStateChange.unbindHandler(&csvPlayHandler);
         std::lock_guard<std::recursive_mutex> lck(recMtx);
         core::modComManager.unregisterInterface(name);
         gui::menu.removeEntry(name);
@@ -181,6 +193,8 @@ public:
         wavRecording = !signalCsvOnly;
         bool csvRecording = signalCsvLogging || signalCsvOnly;
 
+        if (csvRecording && !configureSignalCsv()) { return; }
+
         // Configure the wav writer
         if (recMode == RECORDER_MODE_AUDIO && wavRecording) {
             if (selectedStreamName.empty()) { return; }
@@ -215,8 +229,7 @@ public:
                 if (wavRecording) { writer.close(); }
                 return;
             }
-            signalCsvEmaValid = false;
-            signalCsvFile << "timestamp_unix_ms,frequency_hz,signal_peak_db,signal_avg_db,signal_ema_db\n";
+            signalCsvFile << "timestamp_unix_ms,frequency_hz,signal_peak_db,signal_avg_db,signal_ema_db,noise_db,snr_db,bandwidth_hz,measurement_center_hz,noise_left_db,noise_right_db,window_ms,sample_count,measurement_method\n";
         }
 
         // Open audio stream or baseband
@@ -244,8 +257,9 @@ public:
         recording = true;
         recordingStart = std::chrono::steady_clock::now();
         if (signalCsvFile.is_open()) {
-            signalCsvThreadRunning = true;
-            signalCsvThread = std::thread(&RecorderModule::signalCsvWorker, this);
+            csvSink.start();
+            sigpath::iqFrontEnd.bindIQStream(&csvStream);
+            csvBound = true;
         }
     }
 
@@ -397,7 +411,7 @@ private:
             config.release(true);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Logs selected VFO waterfall FFT level every 100ms. Hardware calibration may vary.");
+            ImGui::SetTooltip("Logs filtered IQ power averaged over 100ms, plus adjacent noise/interference.\nFrequency and bandwidth are fixed at Record. Receiver retuning/rate changes stop recording.\nLevels are relative to IQ full scale, not calibrated dBm.");
         }
         if (!_this->signalCsvLogging) { style::beginDisabled(); }
         if (ImGui::Checkbox(CONCAT("Signal CSV only##_recorder_signal_csv_only_", _this->name), &_this->signalCsvOnly)) {
@@ -412,13 +426,27 @@ private:
         }
         if (!_this->signalCsvLogging) { style::endDisabled(); }
         if (_this->recording) { style::endDisabled(); }
+        if (_this->signalCsvLogging) {
+            ImGui::TextWrapped("CSV: 100 ms averaged IQ power. Frequency and bandwidth fixed at Record.");
+        }
+        if (!_this->csvError.empty()) {
+            ImGui::TextWrapped("%s", _this->csvError.c_str());
+        }
 
         // Record button
         bool canRecord = _this->folderSelect.pathIsValid();
+        if (_this->signalCsvLogging || _this->signalCsvOnly) {
+            canRecord &= gui::mainWindow.isPlaying();
+        }
         if (_this->recMode == RECORDER_MODE_AUDIO && !_this->signalCsvOnly) { canRecord &= !_this->selectedStreamName.empty(); }
         if (!_this->recording) {
+            if (!canRecord) { style::beginDisabled(); }
             if (ImGui::Button(CONCAT("Record##_recorder_rec_", _this->name), ImVec2(menuWidth, 0))) {
                 _this->start();
+            }
+            if (!canRecord) { style::endDisabled(); }
+            if (_this->signalCsvLogging && !gui::mainWindow.isPlaying()) {
+                ImGui::TextWrapped("Start reception before recording CSV.");
             }
             ImGui::TextColored(ImGui::GetStyleColorVec4(ImGuiCol_Text), "Idle --:--:--");
         }
@@ -626,94 +654,154 @@ private:
         _this->writer.write(data, count);
     }
 
-    void stopSignalCsvLogger() {
-        if (signalCsvThreadRunning) {
-            signalCsvThreadRunning = false;
-            if (signalCsvThread.joinable()) {
-                signalCsvThread.join();
+    bool configureSignalCsv() {
+        csvError.clear();
+        if (!gui::mainWindow.isPlaying()) {
+            csvError = "Start reception before recording CSV.";
+            flog::error("Start the receiver before starting signal CSV recording");
+            return false;
+        }
+        auto it = gui::waterfall.vfos.find(gui::waterfall.selectedVFO);
+        if (it == gui::waterfall.vfos.end()) {
+            csvError = "Select a VFO before recording CSV.";
+            flog::error("Select a VFO before starting signal CSV recording");
+            return false;
+        }
+        auto* vfo = it->second;
+        csvInputRate = sigpath::iqFrontEnd.getSampleRate();
+        csvBandwidth = vfo->bandwidth;
+        csvOffset = vfo->centerOffset;
+        csvFrequency = gui::waterfall.getCenterFrequency() + vfo->generalOffset;
+        csvCenter = gui::waterfall.getCenterFrequency() + csvOffset;
+        // Two equal-width reference bands centered +/- 2 bandwidths away.
+        // Leave room for filter transitions and never wrap around the IQ edges.
+        if (!std::isfinite(csvInputRate) || !std::isfinite(csvBandwidth) ||
+            !std::isfinite(csvOffset) || csvBandwidth <= 0 ||
+            std::abs(csvOffset) + 2.75 * csvBandwidth >= csvInputRate / 2) {
+            csvError = "CSV needs room for the signal and both reference bands. Increase source bandwidth or move the VFO.";
+            flog::error("Signal CSV needs room for the VFO and both adjacent reference bands in the IQ passband");
+            return false;
+        }
+        csvOutputRate = std::ceil(std::max(1000.0, 2 * csvBandwidth) / 10) * 10;
+        if (csvOutputRate > csvInputRate) {
+            csvError = "IQ sample rate is too low for CSV recording.";
+            flog::error("IQ sample rate is too low for signal CSV");
+            return false;
+        }
+        for (int i = 0; i < 3; i++) {
+            double offset = csvOffset + (i == 1 ? -2 : i == 2 ? 2 : 0) * csvBandwidth;
+            if (sigpath::iqFrontEnd.isDCBlocking() &&
+                recorder::overlapsDCNotch(offset, csvBandwidth)) {
+                csvError = "IQ correction's DC notch overlaps a measurement band. Offset the receiver center or disable IQ correction.";
+                flog::error("{0}", csvError);
+                return false;
             }
         }
-        if (signalCsvFile.is_open()) {
-            signalCsvFile.close();
+        for (int i = 0; i < 3; i++) {
+            double offset = csvOffset + (i == 1 ? -2 : i == 2 ? 2 : 0) * csvBandwidth;
+            csvFilters[i] = std::make_unique<dsp::channel::RxVFO>(
+                nullptr, csvInputRate, csvOutputRate, csvBandwidth, offset);
+            csvFilters[i]->releaseUnusedProcessBuffers();
+        }
+        csvOutputRate = csvFilters[0]->getActualOutSamplerate();
+        csvClock = std::make_unique<recorder::PowerClock>(csvOutputRate);
+        csvWindow = std::make_unique<recorder::PowerWindow>(csvClock->nextWindowLength());
+        // Discard startup transients, including narrow FIR settling.
+        csvWarmup = std::ceil(csvOutputRate * (0.1 + 100.0 / csvBandwidth));
+        csvSamples = 0;
+        csvEpoch = 0;
+        csvEma = 0;
+        csvEmaValid = false;
+        return true;
+    }
+
+    static void csvRetuned(double, void* ctx) {
+        auto* self = static_cast<RecorderModule*>(ctx);
+        std::lock_guard<std::recursive_mutex> lock(self->recMtx);
+        if (self->csvBound) {
+            flog::warn("Stopping signal CSV recording because reception or receiver settings changed");
+            self->stop();
         }
     }
 
-    void signalCsvWorker() {
-        while (signalCsvThreadRunning) {
-            auto start = std::chrono::steady_clock::now();
-            writeSignalCsvRow();
-            std::this_thread::sleep_until(start + std::chrono::milliseconds(100));
+    static void csvRateChanged(double, void* ctx) {
+        csvRetuned(0, ctx);
+    }
+
+    static void csvPlayChanged(bool playing, void* ctx) {
+        if (!playing) { csvRetuned(0, ctx); }
+    }
+
+    void stopSignalCsvLogger() {
+        if (csvBound) {
+            sigpath::iqFrontEnd.unbindIQStream(&csvStream);
+            csvBound = false;
+        }
+        csvSink.stop();
+        // A stopped reader may leave a queued block. Never replay it on restart.
+        csvStream.flush();
+        for (auto& filter : csvFilters) { filter.reset(); }
+        csvWindow.reset();
+        csvClock.reset();
+        if (signalCsvFile.is_open()) { signalCsvFile.close(); }
+    }
+
+    static void csvIQHandler(dsp::complex_t* data, int count, void* ctx) {
+        auto* self = static_cast<RecorderModule*>(ctx);
+        int n = 0;
+        for (int c = 0; c < 3; c++) {
+            auto& filter = self->csvFilters[c];
+            int produced = filter->process(count, data, filter->out.writeBuf);
+            if (c && produced != n) {
+                flog::error("Signal CSV filter sample counts differ");
+                return;
+            }
+            n = produced;
+        }
+        if (!self->csvEpoch) {
+            // Approximate capture time from arrival of the first processed block.
+            self->csvEpoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()
+                - std::llround(n * 1000.0 / self->csvOutputRate);
+        }
+        for (int i = 0; i < n; i++) {
+            self->csvSamples++;
+            if (self->csvWarmup) { self->csvWarmup--; continue; }
+            double p[3];
+            for (int c = 0; c < 3; c++) {
+                const auto sample = self->csvFilters[c]->out.writeBuf[i];
+                p[c] = double(sample.re) * sample.re + double(sample.im) * sample.im;
+            }
+            if (self->csvWindow->add(p[0], p[1], p[2])) {
+                self->writeSignalCsvRow();
+                self->csvWindow->clear();
+                self->csvWindow->length = self->csvClock->nextWindowLength();
+            }
         }
     }
 
     void writeSignalCsvRow() {
-        SignalLevel signal;
-        if (!getSelectedVFOSignalLevel(signal)) { return; }
-
-        if (!signalCsvEmaValid) {
-            signalCsvEma = signal.peak;
-            signalCsvEmaValid = true;
+        const auto& w = *csvWindow;
+        double power = w.mean(0);
+        double noise = (w.mean(1) + w.mean(2)) / 2;
+        csvEma = csvEmaValid ? 0.2 * power + 0.8 * csvEma : power;
+        csvEmaValid = true;
+        auto timestamp = csvEpoch + std::llround(csvSamples * 1000.0 / csvOutputRate);
+        // SNR estimate subtracts the equal-bandwidth noise estimate first.
+        // Below the reference level, SNR is unknown: emit an empty field.
+        signalCsvFile << timestamp << "," << std::fixed << std::setprecision(0)
+            << csvFrequency << "," << std::setprecision(3)
+            << recorder::PowerWindow::db(w.peak) << ","
+            << recorder::PowerWindow::db(power) << ","
+            << recorder::PowerWindow::db(csvEma) << ","
+            << recorder::PowerWindow::db(noise) << ",";
+        if (power > noise && noise > 0) {
+            signalCsvFile << recorder::PowerWindow::db((power - noise) / noise);
         }
-        else {
-            signalCsvEma = (SIGNAL_CSV_EMA_ALPHA * signal.peak) + ((1.0f - SIGNAL_CSV_EMA_ALPHA) * signalCsvEma);
-        }
-
-        auto now = std::chrono::system_clock::now();
-        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        signalCsvFile << timestamp << "," << std::fixed << std::setprecision(0) << signal.frequency << "," << std::setprecision(3) << signal.peak << "," << signal.average << "," << signalCsvEma << "\n";
-    }
-
-    struct SignalLevel {
-        double frequency;
-        float peak;
-        float average;
-    };
-
-    bool getSelectedVFOSignalLevel(SignalLevel& signal) {
-        std::string vfoName = gui::waterfall.selectedVFO;
-        if (vfoName.empty()) { return false; }
-
-        auto vfoIt = gui::waterfall.vfos.find(vfoName);
-        if (vfoIt == gui::waterfall.vfos.end()) { return false; }
-
-        int dataWidth = 0;
-        float* data = gui::waterfall.acquireLatestFFT(dataWidth);
-        if (!data) { return false; }
-        if (dataWidth <= 0) {
-            gui::waterfall.releaseLatestFFT();
-            return false;
-        }
-
-        ImGui::WaterfallVFO* vfo = vfoIt->second;
-        double center = gui::waterfall.getCenterFrequency() + vfo->generalOffset;
-        double wfCenter = gui::waterfall.getViewOffset() + gui::waterfall.getCenterFrequency();
-        double wfWidth = gui::waterfall.getViewBandwidth();
-        double wfStart = wfCenter - (wfWidth / 2.0);
-        double wfEnd = wfCenter + (wfWidth / 2.0);
-        double low = center - (vfo->bandwidth / 2.0);
-        double high = center + (vfo->bandwidth / 2.0);
-        if (wfWidth <= 0.0 || high < wfStart || low > wfEnd) {
-            gui::waterfall.releaseLatestFFT();
-            return false;
-        }
-        int lowId = std::clamp<int>((low - wfStart) * (double)dataWidth / wfWidth, 0, dataWidth - 1);
-        int highId = std::clamp<int>((high - wfStart) * (double)dataWidth / wfWidth, 0, dataWidth - 1);
-
-        float max = -INFINITY;
-        double sum = 0.0;
-        int count = 0;
-        for (int i = lowId; i <= highId; i++) {
-            if (data[i] > max) { max = data[i]; }
-            sum += data[i];
-            count++;
-        }
-        gui::waterfall.releaseLatestFFT();
-        if (count <= 0) { return false; }
-
-        signal.frequency = center;
-        signal.peak = max;
-        signal.average = sum / (double)count;
-        return true;
+        signalCsvFile << "," << csvBandwidth << "," << csvCenter << ","
+            << recorder::PowerWindow::db(w.mean(1)) << ","
+            << recorder::PowerWindow::db(w.mean(2)) << ","
+            << w.count * 1000.0 / csvOutputRate << "," << w.count << ",filtered_iq_power_v1\n";
     }
 
     static void moduleInterfaceHandler(int code, void* in, void* out, void* ctx) {
@@ -770,11 +858,19 @@ private:
     dsp::sink::Handler<dsp::stereo_t> stereoSink;
     dsp::sink::Handler<float> monoSink;
     std::ofstream signalCsvFile;
-    std::thread signalCsvThread;
-    std::atomic_bool signalCsvThreadRunning = false;
-    float signalCsvEma = 0.0f;
-    bool signalCsvEmaValid = false;
-    static constexpr float SIGNAL_CSV_EMA_ALPHA = 0.2f;
+    dsp::stream<dsp::complex_t> csvStream;
+    dsp::sink::Handler<dsp::complex_t> csvSink;
+    std::array<std::unique_ptr<dsp::channel::RxVFO>, 3> csvFilters;
+    std::unique_ptr<recorder::PowerWindow> csvWindow;
+    std::unique_ptr<recorder::PowerClock> csvClock;
+    std::string csvError;
+    EventHandler<double> csvRetuneHandler, csvRateHandler;
+    EventHandler<bool> csvPlayHandler;
+    bool csvBound = false, csvEmaValid = false;
+    double csvInputRate = 0, csvOutputRate = 0, csvBandwidth = 0;
+    double csvOffset = 0, csvFrequency = 0, csvCenter = 0, csvEma = 0;
+    uint64_t csvWarmup = 0, csvSamples = 0;
+    int64_t csvEpoch = 0;
 
     OptionList<std::string, std::string> audioStreams;
     int streamId = 0;

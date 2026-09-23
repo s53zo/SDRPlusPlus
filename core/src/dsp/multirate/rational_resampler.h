@@ -79,6 +79,13 @@ namespace dsp::multirate {
             base_type::tempStart();
         }
 
+        // Sample-count rate, excluding filter delay and source clock error.
+        // Query after configuration, with no concurrent rate changes.
+        double getActualOutSamplerate() const {
+            assert(base_type::_block_init);
+            return _actualOutSamplerate;
+        }
+
         inline int process(int count, const T* in, T* out) {
             switch(mode) {
                 case Mode::BOTH:
@@ -138,8 +145,10 @@ namespace dsp::multirate {
             int decim = IntSR / gcd;
 
             // Check for excessive error
-            double actualOutSR = (double)IntSR * (double)interp / (double)decim;
-            double error = abs((actualOutSR - _outSamplerate) / _outSamplerate) * 100.0;
+            // The ratio is selected using rounded rates, but samples still
+            // arrive at the unrounded intermediate rate.
+            _actualOutSamplerate = intSamplerate * (double)interp / (double)decim;
+            double error = std::abs((_actualOutSamplerate - _outSamplerate) / _outSamplerate) * 100.0;
             if (error > 0.01) {
                 fprintf(stderr, "Warning: resampling error is over 0.01%%: %lf\n", error);
             }
@@ -169,6 +178,7 @@ namespace dsp::multirate {
         tap<float> rtaps;
         double _inSamplerate;
         double _outSamplerate;
+        double _actualOutSamplerate;
         Mode mode;
     };
 }

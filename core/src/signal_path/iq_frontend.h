@@ -9,6 +9,7 @@
 #include "../dsp/sink/handler_sink.h"
 #include "../dsp/math/conjugate.h"
 #include <fftw3.h>
+#include <utils/synchronized_event.h>
 
 class IQFrontEnd {
 public:
@@ -24,6 +25,9 @@ public:
 
     void setInput(dsp::stream<dsp::complex_t>* in);
     void setSampleRate(double sampleRate);
+    // Emitted before input/rate/correction changes; observers may detach streams.
+    SynchronizedEvent<double> onInputConfigurationChanging;
+    bool isDCBlocking() const { return _dcBlocking; }
     inline double getSampleRate() { return _sampleRate / _decimRatio; }
 
     void setBuffering(bool enabled);
@@ -103,5 +107,6 @@ protected:
     double effectiveSr;
 
     bool _init = false;
+    bool _dcBlocking = false;
 
 };
